@@ -436,86 +436,76 @@ class W2l:
             nb_frames = last_mel_frame
         current_frame = 0
         opts.face_restoration_model = self.face_restore_model
-        def _process_frame(state):
-            i, last_keyframe, speaker_id, needs_processing, c_frame = state
-            frame = all_frames[i % len(all_frames)].copy()
-            
-            if not needs_processing:
-                return frame
-                
-            p, f, c, target = preds[c_frame], pred_frame[c_frame], pred_coords[c_frame], pred_targets[c_frame]
-            y1, y2, x1, x2 = c
-            p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-            
-            if self.video_quality in ["Medium", "High"]:
-                image_restored = frame.copy()
-                if self.video_quality == "High":
-                    p = self.restore_face(p, opts)
-
-                if self.align_face and "center" in target.__dict__:
-                    center = (int(target.center[0]-x1), int(target.center[1]-y1))
-                    M = cv2.getRotationMatrix2D(center, -target.angle, 1)
-                    p = cv2.warpAffine(p, M, (p.shape[1], p.shape[0]))
-
-                    masque = np.ones_like(p, dtype=np.uint8) * 255
-                    rotated_masque = cv2.warpAffine(masque, M, (p.shape[1], p.shape[0]))
-                    masque_binaire = cv2.cvtColor(rotated_masque, cv2.COLOR_BGR2GRAY)
-                    p = np.where(masque_binaire[..., None] == 255, p, image_restored[y1:y2, x1:x2])
-                
-                image_restored[y1:y2, x1:x2] = p
-                image_restored_gray = cv2.cvtColor(image_restored, cv2.COLOR_RGB2GRAY)
-                jaw, nose, mouth = self.get_face_info(target)
-                original_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-                
-                face_property = last_keyframe["faces_properties"][speaker_id]
-                masked_save = self.create_mask(original_gray, image_restored_gray, face_property, jaw, nose, mouth)
-
-                extended_mask = np.stack([masked_save] * 3, axis=-1)
-                normalized_mask = extended_mask / 255.0
-                dst = image_restored * normalized_mask
-                original_frame = frame * (1 - normalized_mask) + dst
-                original_frame = original_frame.astype(np.uint8)
-                frame = original_frame
-            else:
-                if self.align_face and "angle" in target.__dict__:
-                    center = (int(target.center[0] - x1), int(target.center[1] - y1))
-                    M = cv2.getRotationMatrix2D(center, -target.angle, 1)
-                    p = cv2.warpAffine(p, M, (p.shape[1], p.shape[0]))
-
-                    masque = np.ones_like(p, dtype=np.uint8) * 255
-                    rotated_masque = cv2.warpAffine(masque, M, (p.shape[1], p.shape[0]))
-                    masque_binaire = cv2.cvtColor(rotated_masque, cv2.COLOR_BGR2GRAY)
-                    p = np.where(masque_binaire[..., None] == 255, p, frame[y1:y2, x1:x2])
-
-                frame[y1:y2, x1:x2] = p
-                
-            return frame
-
-        frame_states = []
-        last_keyframe = None
-        speaker_id = None
-        current_frame = 0
-        
         for i in range(nb_frames):
             keyframe = [x for x in self.keyframes if x["frame"] == str(i + 1)]
+
             if keyframe:
+                speaker = False
                 last_keyframe = keyframe[0]
                 if last_keyframe["faces"] > 0:
                     speaker = any([True for x in last_keyframe["faces_properties"] if x["speaker"] == True])
                     if speaker:
-                        speaker_id = [x for x, key in enumerate(last_keyframe["faces_properties"]) if key["speaker"] == True][0]
-            
-            needs_processing = (i not in no_face_frames) and (i < len(mel_chunks) + self.sound_start_frame)
-            frame_states.append((i, last_keyframe, speaker_id, needs_processing, current_frame))
-            if needs_processing:
-                current_frame += 1
+                        speaker_id = \
+                            [x for x, key in enumerate(last_keyframe["faces_properties"]) if key["speaker"] == True][0]
 
-        import concurrent.futures
-        max_workers = 3 if self.video_quality == "High" else 8
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for i, result_frame in enumerate(executor.map(_process_frame, frame_states)):
-                print(f"[INFO] saving: {i} of {nb_frames} - ", end="\r")
-                video_output.write(result_frame)
+            print("[INFO] saving: " + str(i) + " of " + str(nb_frames) + " - ", end="\r")
+            frame = all_frames[i % len(all_frames)]
+            if i not in no_face_frames and i < len(mel_chunks) + self.sound_start_frame:
+                p, f, c, target = preds[current_frame], pred_frame[current_frame], pred_coords[current_frame], \
+                                      pred_targets[current_frame]
+                y1, y2, x1, x2 = c
+                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+                #cv2.imwrite(f"{self.project_folder}/debug/w2l{i}.jpg", p)
+                # From Here
+                if self.video_quality in ["Medium", "High"]:
+                    image_restored = frame.copy()
+                    if self.video_quality == "High":
+                        p = self.restore_face(p, opts)
+
+                    if self.align_face and "center" in target.__dict__:
+                        center = (int(target.center[0]-x1), int(target.center[1]-y1))
+                        M = cv2.getRotationMatrix2D(center, -target.angle, 1)
+                        p = cv2.warpAffine(p, M, (p.shape[1], p.shape[0]))
+
+                        masque = np.ones_like(p, dtype=np.uint8) * 255
+                        rotated_masque = cv2.warpAffine(masque, M, (p.shape[1], p.shape[0]))
+                        masque_binaire = cv2.cvtColor(rotated_masque, cv2.COLOR_BGR2GRAY)
+                        p = np.where(masque_binaire[..., None] == 255, p, image_restored[y1:y2, x1:x2])
+                    #cv2.imwrite(f"{self.project_folder}/debug/w2l_r{i}.jpg", p)
+                    #apply restored face to original image if rgb pixel in p is not black
+                    image_restored[y1:y2, x1:x2] = p
+
+                    image_restored_gray = cv2.cvtColor(image_restored, cv2.COLOR_RGB2GRAY)
+                    jaw, nose, mouth = self.get_face_info(target)
+
+                    original_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+                    face_property = last_keyframe["faces_properties"][speaker_id]
+                    masked_save = self.create_mask(original_gray, image_restored_gray, face_property, jaw, nose, mouth)
+
+                    # Apply restored face to original image with mask attention
+                    extended_mask = np.stack([masked_save] * 3, axis=-1)
+                    normalized_mask = extended_mask / 255.0
+                    dst = image_restored * normalized_mask
+                    original_frame = frame * (1 - normalized_mask) + dst
+                    original_frame = original_frame.astype(np.uint8)
+                    frame = original_frame
+                    # To Here
+                else:
+                    if self.align_face and "angle" in target.__dict__:
+                        center = (int(target.center[0] - x1), int(target.center[1] - y1))
+                        M = cv2.getRotationMatrix2D(center, -target.angle, 1)
+                        p = cv2.warpAffine(p, M, (p.shape[1], p.shape[0]))
+
+                        masque = np.ones_like(p, dtype=np.uint8) * 255
+                        rotated_masque = cv2.warpAffine(masque, M, (p.shape[1], p.shape[0]))
+                        masque_binaire = cv2.cvtColor(rotated_masque, cv2.COLOR_BGR2GRAY)
+                        p = np.where(masque_binaire[..., None] == 255, p, frame[y1:y2, x1:x2])
+
+                    frame[y1:y2, x1:x2] = p
+
+                current_frame += 1
+            video_output.write(frame)
         # release memory
         video_output.release()
         model.cpu()

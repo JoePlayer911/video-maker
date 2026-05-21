@@ -359,11 +359,11 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
 
     yield append_log("<br>🎉 <b>MASTER BATCH QUEUE CLEARED!</b>", "\n========== ALL FOLDERS PROCESSED ==========")
 
-def process_simple(max_resolution_limit):
+def process_simple(video_quality, max_resolution_limit):
     # Calling process_folders with strictly default values yielding two variables cleanly
     for basic_log, raw_log in process_folders(
         DEFAULT_REF_AUDIO, DEFAULT_REF_TEXT, "Chinese (zh)", "Chinese (zh)",
-        video_quality="High", restore_model="GFPGAN", resize_factor=1, stop_video=True, random_cut=True,
+        video_quality=video_quality, restore_model="GFPGAN", resize_factor=1, stop_video=True, random_cut=True,
         max_resolution_limit=max_resolution_limit
     ): 
         yield basic_log, raw_log
@@ -384,9 +384,11 @@ with gr.Blocks(title="AI Video Studio Automation", css=custom_css, theme=gr.them
         # SIMPLE MODE TAB
         with gr.TabItem("🚀 Simple Mode"):
             gr.Markdown("### Start the magic with a single click. Uses default optimized settings.")
-            gr.Markdown("**Voice Reference**: LuckyV2 (Chinese) | **Quality**: High with GFPGAN Restore")
+            gr.Markdown("**Voice Reference**: LuckyV2 (Chinese) | **Face Restoration**: GFPGAN (if High Quality)")
             
-            max_resolution_simple = gr.Slider(label="Maximum Video Resolution (Height/Width)", minimum=240, maximum=2160, step=40, value=1280)
+            with gr.Row():
+                video_quality_simple = gr.Radio(label="Video Quality", choices=["Fast", "High"], value="Fast")
+                max_resolution_simple = gr.Slider(label="Maximum Video Resolution (Height/Width)", minimum=240, maximum=2160, step=40, value=1280)
             
             run_btn_simple = gr.Button("▶ START BATCH PROCESSING", elem_classes=["run-btn"])
             
@@ -398,7 +400,7 @@ with gr.Blocks(title="AI Video Studio Automation", css=custom_css, theme=gr.them
                 gr.Markdown("### 💻 Debug Raw Action Logs")
                 logs_box_simple = gr.Textbox(label="Raw Application Logs", lines=10, max_lines=20, interactive=False)
             
-            run_btn_simple.click(fn=process_simple, inputs=[max_resolution_simple], outputs=[logs_html_simple, logs_box_simple])
+            run_btn_simple.click(fn=process_simple, inputs=[video_quality_simple, max_resolution_simple], outputs=[logs_html_simple, logs_box_simple])
 
         # ADVANCED MODE TAB
         with gr.TabItem("⚙️ Advanced Mode"):
