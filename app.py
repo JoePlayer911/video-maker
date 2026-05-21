@@ -1,0 +1,445 @@
+import gradio as gr
+import os
+import glob
+import shutil
+import requests
+import subprocess
+import cv2
+import random
+
+# Dynamically resolve paths for absolute portability across systems
+# Dynamically resolve paths for absolute portability
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SOVITS_DIR = os.path.join(BASE_DIR, "GPT-SoVITS-v2pro-20250604")
+SOVITS_RUNTIME = os.path.join(SOVITS_DIR, "runtime")
+
+# Add bundled FFmpeg/Python to PATH for this process
+if os.path.exists(SOVITS_RUNTIME):
+    os.environ["PATH"] = SOVITS_RUNTIME + os.pathsep + os.environ.get("PATH", "")
+
+INPUT_DIR = os.path.join(BASE_DIR, "input")
+WAV2LIP_DIR = os.path.join(BASE_DIR, "wav2lip-studio")
+
+# Priority: wav2lip-studio Venv > Bundled SoVITS Python (most portable)
+WAV2LIP_PYTHON = os.path.join(WAV2LIP_DIR, "venv", "Scripts", "python.exe")
+if not os.path.exists(WAV2LIP_PYTHON):
+    WAV2LIP_PYTHON = os.path.join(SOVITS_RUNTIME, "python.exe")
+
+BRIDGE_SCRIPT = os.path.join(WAV2LIP_DIR, "auto_wav2lip.py")
+
+DEFAULT_REF_AUDIO = os.path.join(SOVITS_DIR, "output", "slicer_opt", "LuckyV2", "有些事情好恐怖哦，是怎么回事呢，太好笑了，如果你们要找家庭看护工或家庭帮佣.wav")
+DEFAULT_REF_TEXT = "有些事情好恐怖哦，是怎么回事呢，太好笑了，如果你们要找家庭看护工或家庭帮佣"
+FALLBACK_VIDEO_DIR = os.path.join(BASE_DIR, "original", "video")
+DEFAULT_VIDEO_FALLBACK = os.path.join(FALLBACK_VIDEO_DIR, "input_vid.mp4")
+
+def is_valid_video(vid_path):
+    try:
+        cap = cv2.VideoCapture(vid_path)
+        valid = cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0
+        cap.release()
+        return valid
+    except:
+        return False
+
+def check_server(log_yield=None):
+    if log_yield:
+        log_yield("Checking local API servers... ⏳", "[INFO] Checking if GPT-SoVITS API server is ready (might be loading models)...")
+        
+    for attempt in range(15):
+        try:
+            requests.get("http://127.0.0.1:9880/", timeout=2, proxies={"http": None, "https": None})
+            if log_yield: log_yield("Server connectivity verified! ✅", "[INFO] GPT-SoVITS server is online and responding!\n")
+            return True
+        except requests.exceptions.ConnectionError:
+            import time
+            time.sleep(2)
+            continue
+        except Exception:
+            if log_yield: log_yield("Server connectivity verified! ✅", "[INFO] GPT-SoVITS server is online and responding!\n")
+            return True 
+            
+    return False
+
+def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, restore_model, resize_factor, stop_video, random_cut, max_resolution_limit=1280):
+    basic_log = ""
+    raw_log = ""
+    
+    def append_log(basic_msg, raw_msg=None, is_error=False):
+        nonlocal basic_log, raw_log
+        
+        if basic_msg:
+            # HTML Formatting for Basic Log
+            color = "#ef4444" if is_error else "#10b981" if "✅" in basic_msg else "#f8fafc"
+            basic_log += f"<div style='color: {color}; margin-bottom: 4px;'>{basic_msg}</div>"
+            
+        if raw_msg:
+            raw_log += raw_msg + "\n"
+        elif basic_msg:
+            raw_log += f"[SYSTEM] {basic_msg}\n"
+            
+        # Wrap basic log inside a scrolling container
+        html_wrapper = f"<div style='background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 15px; height: 250px; overflow-y: auto; font-family: monospace; font-size: 14px;'>{basic_log}</div>"
+        
+        return html_wrapper, raw_log
+
+    if not os.path.exists(INPUT_DIR):
+        yield append_log("🚨 The 'input' directory does not exist! Please create it.", f"[ERROR] The input directory '{INPUT_DIR}' does not exist.", is_error=True)
+        return
+
+    yield append_log("Booting up processing pipeline...", "[INFO] Checking GPT-SoVITS connection...")
+    
+    server_ready = False
+    for attempt in range(10):
+        try:
+            requests.get("http://127.0.0.1:9880/", timeout=3, proxies={"http": None, "https": None})
+            server_ready = True
+            break
+        except requests.exceptions.ConnectionError:
+            yield append_log(f"Waiting for backend to load (Step {attempt+1}/10)... ⏳", f"[WAITING] Server not ready yet... (Attempt {attempt+1}/10. Maybe still loading weights?)")
+            import time
+            time.sleep(3)
+        except Exception:
+            server_ready = True
+            break
+
+    if not server_ready:
+        yield append_log("🚨 Background AI Server crashing or offline. Please launch 'run_servers.bat'!", "[ERROR] GPT-SoVITS API Server is NOT running!", is_error=True)
+        return
+
+    folders = [f.path for f in os.scandir(INPUT_DIR) if f.is_dir()]
+    if not folders:
+        yield append_log("No structural folders detected in 'input/' to process.", f"[WARNING] No folders found in '{INPUT_DIR}'.")
+        return
+        
+    yield append_log(f"Detected {len(folders)} folders! Ready and organizing...", f"[INFO] Found {len(folders)} folders to process.")
+    
+    for folder in folders:
+        folder_name = os.path.basename(folder)
+        yield append_log(f"<br><b>➡️ Working on Folder [{folder_name}]</b>", f"\n========== Processing Folder: {folder_name} ==========")
+        
+        # Check if already processed
+        video_files = glob.glob(os.path.join(folder, "*.mp4"))
+        generated_exists = any(os.path.basename(v).startswith("generated_video_") for v in video_files)
+        
+        if generated_exists:
+            yield append_log(f"⚠️ Skipping Folder [{folder_name}] (Already generated previously)", f"[SKIP] Folder '{folder_name}' has already been processed.")
+            continue
+            
+        videos = [v for v in video_files if not os.path.basename(v).startswith("generated_video_")]
+        txts = glob.glob(os.path.join(folder, "*.txt"))
+        
+        # Guardrail: Check text file integrity
+        if len(txts) == 0:
+            yield append_log("🔴 Missing text script!", f"[ERROR] No text file found in folder '{folder_name}'.", is_error=True)
+            continue
+            
+        txt_path = txts[0]
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                target_text = f.read().strip()
+            if not target_text:
+                raise ValueError("Text string is empty.")
+        except Exception as e:
+            yield append_log(f"🔴 RED WARNING: '{os.path.basename(txt_path)}' is corrupted or entirely empty! Skipping folder.", f"[ERROR] Text file read failure: {str(e)}", is_error=True)
+            continue
+        
+        # Guardrail: Check video file integrity & fallback logic
+        active_video_path = None
+        if len(videos) > 0:
+            active_video_path = videos[0]
+            if not is_valid_video(active_video_path):
+                yield append_log("⚠️ User-provided video was corrupted or unsupported. Intervening with default fallback...", f"[WARN] Video '{active_video_path}' failed cv2 validation.")
+                active_video_path = None
+                
+        if not active_video_path:
+            fallback_videos = []
+            if os.path.exists(FALLBACK_VIDEO_DIR):
+                fallback_videos = [v for v in glob.glob(os.path.join(FALLBACK_VIDEO_DIR, "*.mp4")) if not os.path.basename(v).startswith("generated_video_")]
+            
+            if fallback_videos:
+                active_video_path = random.choice(fallback_videos)
+                yield append_log(f"✅ Assigned random Fallback Video: {os.path.basename(active_video_path)}", f"[INFO] Hooking fallback video from directory: {active_video_path}")
+            elif os.path.exists(DEFAULT_VIDEO_FALLBACK):
+                active_video_path = DEFAULT_VIDEO_FALLBACK
+                yield append_log("✅ Assigned verified Global Fallback Video.", f"[INFO] Hooking fallback video: {DEFAULT_VIDEO_FALLBACK}")
+            else:
+                yield append_log("🔴 RED WARNING: No valid input video AND fallback missing! Skipping folder.", f"[ERROR] No input video & Default Video missing.", is_error=True)
+                continue
+                
+        video_name = os.path.basename(active_video_path)
+        
+        import time
+        start_time = time.time()
+        
+        yield append_log(f"🎙 Generating new AI Voice audio tracks...", f"[INFO] Target Text: '{target_text}'\n-> Starting GPT-SoVITS TTS...")
+        
+        # 2. RUN TTS
+        audio_output_path = os.path.join(folder, "generated_audio.wav")
+        if os.path.exists(audio_output_path):
+            yield append_log("✅ Found pre-existing audio track, skipping voice render!", f"-> Found '{audio_output_path}', bypassing TTS phase.")
+        else:
+            tts_payload = {
+                "text": target_text,
+                "text_lang": "zh" if "Chinese" in target_lang else "en",
+                "ref_audio_path": ref_audio,
+                "prompt_text": ref_text,
+                "prompt_lang": "zh" if "Chinese" in ref_lang else "en",
+                "media_type": "wav"
+            }
+            
+            try:
+                response = requests.post("http://127.0.0.1:9880/tts", json=tts_payload, timeout=180, proxies={"http": None, "https": None})
+                if response.status_code != 200:
+                    yield append_log(f"🔴 Audio engine network crashed. Skipping this folder.", f"[ERROR] TTS failed. Status {response.status_code}: {response.text}", is_error=True)
+                    continue
+            except Exception as e:
+                yield append_log(f"🔴 Fatal connection error to audio generator.", f"[ERROR] TTS request error: {str(e)}", is_error=True)
+                continue
+                
+            with open(audio_output_path, "wb") as f:
+                f.write(response.content)
+                
+            yield append_log("✅ Voice rendered successfully!", f"-> TTS Audio generated successfully: {audio_output_path}")
+        
+        # 2b. RANDOM VIDEO CUTTER
+        if random_cut:
+            yield append_log(f"✂ Calculating algorithmic crop...", f"-> Applying Random Start Video Cutter...")
+            import wave
+            
+            audio_duration = 0.0
+            try:
+                with wave.open(audio_output_path, 'rb') as w:
+                    frames_w = w.getnframes()
+                    rate = w.getframerate()
+                    audio_duration = frames_w / float(rate)
+            except Exception as e:
+                yield append_log(None, f"[WARNING] Could not read audio duration: {e}")
+                
+            video_duration = 0.0
+            try:
+                cap = cv2.VideoCapture(active_video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if fps > 0:
+                    video_duration = frame_count / fps
+                cap.release()
+            except Exception as e:
+                yield append_log(None, f"[WARNING] Could not read video duration: {e}")
+                
+            if audio_duration > 0 and video_duration > 0:
+                cut_length = audio_duration + 1.0 # 1.0 second padding to capture trailing syllables
+                if video_duration > cut_length:
+                    max_start = video_duration - cut_length
+                    random_start = random.uniform(0.0, max_start)
+                    
+                    import time
+                    unique_id = str(int(time.time()))
+                    random_cut_path = os.path.join(folder, f"temp_cut_{unique_id}.mp4")
+                    
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y", "-ss", str(random_start), "-i", active_video_path, 
+                        "-t", str(cut_length), "-c:v", "copy", "-c:a", "copy", random_cut_path
+                    ]
+                    
+                    try:
+                        result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+                        active_video_path = random_cut_path
+                        yield append_log("✅ Subclip isolated!", f"   [Cutter] Sliced video from {round(random_start, 2)}s to {round(random_start+cut_length, 2)}s")
+                    except subprocess.CalledProcessError as e:
+                        yield append_log(None, f"[WARNING] ffmpeg cut failed, using original video. Error: {e.stderr}")
+                    except Exception as e:
+                        yield append_log(None, f"[WARNING] ffmpeg cut structural failure, using original video. Error: {e}")
+                else:
+                    yield append_log(None, f"   [Cutter] Video length is too short to cut ({round(video_duration,1)}s <= audio {round(audio_duration,1)}s). Using full.")
+            else:
+                yield append_log(None, f"[WARNING] Invalid duration fetched (V: {video_duration}, A: {audio_duration}), skipping random cut.")
+        # 2c. VIDEO DOWN-SAMPLER / PREPROCESS
+        if max_resolution_limit and max_resolution_limit > 0:
+            try:
+                cap = cv2.VideoCapture(active_video_path)
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+                
+                if width > max_resolution_limit or height > max_resolution_limit:
+                    scale = float(max_resolution_limit) / float(max(width, height))
+                    new_width = (int(width * scale) // 2) * 2
+                    new_height = (int(height * scale) // 2) * 2
+                    
+                    yield append_log(f"📐 Downscaling video to fit max {max_resolution_limit}px ({new_width}x{new_height})...", f"[PREPROCESS] Scaling {width}x{height} to {new_width}x{new_height}...")
+                    
+                    import time
+                    unique_id = str(int(time.time()))
+                    resized_path = os.path.join(folder, f"temp_resized_{unique_id}.mp4")
+                    
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y", "-i", active_video_path,
+                        "-vf", f"scale={new_width}:{new_height}",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                        "-c:a", "copy", resized_path
+                    ]
+                    
+                    try:
+                        result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+                        
+                        # Clean up previous temporary cut file if it was created during random cut
+                        if "temp_cut_" in active_video_path and os.path.exists(active_video_path):
+                            try:
+                                os.remove(active_video_path)
+                            except Exception as e:
+                                yield append_log(None, f"[WARNING] Could not delete temp cut clip during resize: {e}")
+                                
+                        active_video_path = resized_path
+                        yield append_log(f"✅ Downscaling complete!", f"[PREPROCESS] Video successfully resized to {new_width}x{new_height} and saved to {resized_path}")
+                    except subprocess.CalledProcessError as e:
+                        yield append_log("⚠️ Downscaling failed, using original video size.", f"[WARNING] ffmpeg resize failed. Error: {e.stderr}")
+                    except Exception as e:
+                        yield append_log("⚠️ Downscaling failed, using original video size.", f"[WARNING] ffmpeg resize error: {e}")
+            except Exception as e:
+                yield append_log(None, f"[WARNING] Could not read video dimensions for resizing: {e}")
+        
+        # 3. RUN WAV2LIP
+        yield append_log("🎬 Binding Video and Audio (Lip-syncing)... ETA ~3 Minutes", f"-> Starting Wav2Lip Studio Pipeline...")
+        project_name = f"auto_project_{folder_name}"
+        wav2lip_cmd = [
+            WAV2LIP_PYTHON, "-u", BRIDGE_SCRIPT, 
+            "--project", project_name, 
+            "--video", active_video_path, 
+            "--audio", audio_output_path,
+            "--video_quality", video_quality,
+            "--restore_model", restore_model,
+            "--resize_factor", str(int(resize_factor))
+        ]
+        if stop_video:
+            wav2lip_cmd.append("--stop_video")
+            
+        try:
+            env_unbuffered = os.environ.copy()
+            env_unbuffered["PYTHONUNBUFFERED"] = "1"
+            process = subprocess.Popen(wav2lip_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=WAV2LIP_DIR, env=env_unbuffered)
+            buffer = []
+            while True:
+                char = process.stdout.read(1)
+                if not char:
+                    break
+                if char in ['\n', '\r']:
+                    if buffer:
+                        line = "".join(buffer).strip()
+                        if line:
+                            yield append_log(None, f"   [Wav2Lip] {line}")
+                        buffer = []
+                else:
+                    buffer.append(char)
+            process.wait()
+            if process.returncode != 0:
+                yield append_log("🔴 Wav2Lip integration engine completely crashed! Check real logs.", f"[ERROR] Wav2Lip failed with exit code {process.returncode}.", is_error=True)
+                continue
+        except Exception as e:
+            yield append_log("🔴 Wav2Lip execution environment missing or dead.", f"[ERROR] Error executing Wav2Lip: {str(e)}", is_error=True)
+            continue
+            
+        # 4. MOVE VIDEO BACK
+        wav2lip_output = os.path.join(WAV2LIP_DIR, "projects", project_name, "wav2lip", "video.mp4")
+        if os.path.exists(wav2lip_output):
+            final_video_path = os.path.join(folder, f"generated_video_{video_name}")
+            shutil.copy(wav2lip_output, final_video_path)
+            
+            end_time = time.time()
+            elapsed = round(end_time - start_time, 2)
+            yield append_log(f"✅ SUCCESSFULLY COMPLETED! Took {elapsed} seconds.", f"[COMPLETED] Successfully created: {final_video_path} (Took {elapsed} seconds)")
+        else:
+            yield append_log("🔴 Final generated output map was detached/missing.", f"[ERROR] Could not find Wav2Lip studio output at '{wav2lip_output}'.", is_error=True)
+            
+        # 5. CLEANUP TEMPS
+        if "temp_" in active_video_path and os.path.exists(active_video_path):
+            try:
+                os.remove(active_video_path)
+            except Exception as e:
+                yield append_log(None, f"[WARNING] Could not delete temporary clip {active_video_path}: {e}")
+
+    yield append_log("<br>🎉 <b>MASTER BATCH QUEUE CLEARED!</b>", "\n========== ALL FOLDERS PROCESSED ==========")
+
+def process_simple(max_resolution_limit):
+    # Calling process_folders with strictly default values yielding two variables cleanly
+    for basic_log, raw_log in process_folders(
+        DEFAULT_REF_AUDIO, DEFAULT_REF_TEXT, "Chinese (zh)", "Chinese (zh)",
+        video_quality="High", restore_model="GFPGAN", resize_factor=1, stop_video=True, random_cut=True,
+        max_resolution_limit=max_resolution_limit
+    ): 
+        yield basic_log, raw_log
+
+# --- GUI DEFINITION ---
+custom_css = """
+body { font-family: 'Inter', sans-serif; }
+.run-btn { background-image: linear-gradient(to right, #43e97b 0%, #38f9d7 100%); color: #000; border: none; padding: 15px; font-weight: bold; border-radius: 8px; transition: transform 0.2s; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+.run-btn:hover { transform: translateY(-2px); }
+.gradio-container { background: #0f172a; } 
+div.gradio-container { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); color: #e2e8f0; }
+"""
+
+with gr.Blocks(title="AI Video Studio Automation", css=custom_css, theme=gr.themes.Base()) as demo:
+    gr.HTML("<center><h1>🎙️ Auto TTS & Lipsync Studio 🎬</h1><p>Automate your workflow using GPT-SoVITS-v2 and Wav2Lip Studio seamlessly.</p></center>")
+    
+    with gr.Tabs():
+        # SIMPLE MODE TAB
+        with gr.TabItem("🚀 Simple Mode"):
+            gr.Markdown("### Start the magic with a single click. Uses default optimized settings.")
+            gr.Markdown("**Voice Reference**: LuckyV2 (Chinese) | **Quality**: High with GFPGAN Restore")
+            
+            max_resolution_simple = gr.Slider(label="Maximum Video Resolution (Height/Width)", minimum=240, maximum=2160, step=40, value=1280)
+            
+            run_btn_simple = gr.Button("▶ START BATCH PROCESSING", elem_classes=["run-btn"])
+            
+            with gr.Column():
+                gr.Markdown("### 👤 User Logs")
+                logs_html_simple = gr.HTML()
+                
+            with gr.Column():    
+                gr.Markdown("### 💻 Debug Raw Action Logs")
+                logs_box_simple = gr.Textbox(label="Raw Application Logs", lines=10, max_lines=20, interactive=False)
+            
+            run_btn_simple.click(fn=process_simple, inputs=[max_resolution_simple], outputs=[logs_html_simple, logs_box_simple])
+
+        # ADVANCED MODE TAB
+        with gr.TabItem("⚙️ Advanced Mode"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### 🎙️ TTS Reference Config")
+                    ref_audio_input = gr.Textbox(label="Reference Audio Path (.wav)", value=DEFAULT_REF_AUDIO, lines=2)
+                    ref_text_input = gr.Textbox(label="Reference Text", value=DEFAULT_REF_TEXT, lines=2)
+                    
+                    with gr.Row():
+                        ref_lang_input = gr.Dropdown(label="Reference Language", choices=["Chinese (zh)", "English (en)"], value="Chinese (zh)")
+                        target_lang_input = gr.Dropdown(label="Target Spoken Language", choices=["Chinese (zh)", "English (en)", "Japanese (ja)"], value="Chinese (zh)")
+                        
+                with gr.Column(scale=2):
+                    gr.Markdown("### 🎬 Wav2Lip Settings")
+                    video_quality_input = gr.Dropdown(label="Video Quality", choices=["High", "Medium", "Fast"], value="High")
+                    restore_model_input = gr.Dropdown(label="Face Restoration Model", choices=["GFPGAN", "CodeFormer", "None"], value="GFPGAN")
+                    resize_factor_input = gr.Slider(label="Resize Factor (Downscale)", minimum=1, maximum=4, step=1, value=1)
+                    max_resolution_adv = gr.Slider(label="Maximum Video Resolution (Height/Width)", minimum=240, maximum=2160, step=40, value=1280)
+                    stop_video_input = gr.Checkbox(label="Cut Video exactly at Audio duration stop", value=True)
+                    random_cut_input = gr.Checkbox(label="Enable Random Start Point Video Cutter", value=True)
+                    
+            run_btn_adv = gr.Button("▶ START BATCH PROCESSING", elem_classes=["run-btn"])
+            
+            with gr.Column():
+                gr.Markdown("### 👤 User Logs")
+                logs_html_adv = gr.HTML()
+                
+            with gr.Column():
+                gr.Markdown("### 💻 Debug Raw Action Logs")
+                logs_box_adv = gr.Textbox(label="Raw Application Logs", lines=10, max_lines=20, interactive=False)
+                
+            run_btn_adv.click(
+                fn=process_folders, 
+                inputs=[
+                    ref_audio_input, ref_text_input, ref_lang_input, target_lang_input, 
+                    video_quality_input, restore_model_input, resize_factor_input, 
+                    stop_video_input, random_cut_input, max_resolution_adv
+                ], 
+                outputs=[logs_html_adv, logs_box_adv]
+            )
+
+if __name__ == "__main__":
+    demo.launch(inbrowser=True, server_port=7860)

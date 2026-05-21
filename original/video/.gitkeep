@@ -1,0 +1,2 @@
+# This directory holds driving videos for lip-sync.
+# Place .mp4 files here. The pipeline will randomly select one as fallback.

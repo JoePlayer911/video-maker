@@ -1,0 +1,75 @@
+# ============================================
+# Bundled Runtimes & Large Dependencies
+# ============================================
+GPT-SoVITS-v2pro-20250604/
+python.zip
+
+# ============================================
+# wav2lip-studio (external dependency)
+# Keep our custom bridge scripts, ignore everything else
+# ============================================
+wav2lip-studio/venv/
+wav2lip-studio/models/
+wav2lip-studio/projects/
+wav2lip-studio/tmp/
+wav2lip-studio/CodeFormer/
+wav2lip-studio/demo/
+wav2lip-studio/extensions/
+wav2lip-studio/modules/
+wav2lip-studio/__pycache__/
+wav2lip-studio/scripts/__pycache__/
+wav2lip-studio/scripts/analyse/__pycache__/
+wav2lip-studio/scripts/wav2lip/__pycache__/
+wav2lip-studio/scripts/faceswap/
+wav2lip-studio/scripts/translator/
+wav2lip-studio/scripts/tts/
+wav2lip-studio/scripts/utils/
+wav2lip-studio/scripts/vocal/
+wav2lip-studio/scripts/ui.py
+wav2lip-studio/scripts/wav2lip_uhq_extend_paths.py
+wav2lip-studio/get-pip.py
+wav2lip-studio/wav2lip_studio.py
+wav2lip-studio/wav2lip-studio.bat
+wav2lip-studio/wav2lip-studio.sh
+wav2lip-studio/api_keys.json
+
+# ============================================
+# User Data / Generated Content
+# ============================================
+input/*/generated_audio.wav
+input/*/generated_video_*.mp4
+input/*/temp_cut_*.mp4
+input/*/temp_resized_*.mp4
+
+# Driving videos & raw source material
+original/video/*.mp4
+original/*.zip
+
+# ============================================
+# Python Caches
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ============================================
+# IDE / Editor
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================
+# OS Files
+# ============================================
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ============================================
+# Misc
+# ============================================
+*.log
