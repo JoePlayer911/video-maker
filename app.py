@@ -95,6 +95,95 @@ def stop_sovits_server():
         pass
     yield "GPT-SoVITS unloaded from memory! ✅", "[INFO] VRAM is now free for Wav2Lip."
 
+def smart_video_looper(audio_path, video_path, folder_path):
+    try:
+        from pydub import AudioSegment
+        from pydub.silence import detect_silence
+    except ImportError:
+        yield None, "[WARNING] pydub not installed, skipping smart-loop.", video_path
+        return
+        
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        audio_duration = len(audio) / 1000.0
+    except Exception as e:
+        yield None, f"[WARNING] pydub could not read audio: {e}", video_path
+        return
+        
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = frame_count / fps if fps > 0 else 0
+        cap.release()
+    except Exception as e:
+        yield None, f"[WARNING] cv2 could not read video: {e}", video_path
+        return
+        
+    if video_duration <= 0 or audio_duration <= video_duration:
+        yield None, None, video_path
+        return
+        
+    yield f"🔄 Audio is longer than video ({round(audio_duration, 1)}s > {round(video_duration, 1)}s). Smart-looping at pauses...", f"[SMART LOOP] Audio: {audio_duration}s, Video: {video_duration}s", None
+    
+    try:
+        silences_ms = detect_silence(audio, min_silence_len=400, silence_thresh=audio.dBFS-16)
+        pauses_s = [(start + end) / 2000.0 for start, end in silences_ms]
+    except Exception as e:
+        yield None, f"[WARNING] Failed to detect silence: {e}", None
+        pauses_s = []
+
+    current_audio_time = 0.0
+    clips = []
+    
+    while current_audio_time < audio_duration:
+        max_reach = current_audio_time + video_duration
+        if max_reach >= audio_duration:
+            clips.append(audio_duration - current_audio_time)
+            break
+            
+        min_acceptable_pause = current_audio_time + (video_duration * 0.4)
+        valid_pauses = [p for p in pauses_s if min_acceptable_pause <= p <= max_reach]
+        
+        if valid_pauses:
+            chosen_pause = valid_pauses[-1]
+            clip_len = chosen_pause - current_audio_time
+            clips.append(clip_len)
+            current_audio_time = chosen_pause
+        else:
+            clips.append(video_duration)
+            current_audio_time += video_duration
+            
+    if not clips:
+        yield None, None, video_path
+        return
+        
+    import time
+    unique_id = str(int(time.time()))
+    concat_txt_path = os.path.join(folder_path, f"temp_concat_{unique_id}.txt")
+    extended_video_path = os.path.join(folder_path, f"temp_extended_{unique_id}.mp4")
+    
+    try:
+        with open(concat_txt_path, "w", encoding="utf-8") as f:
+            for clip_len in clips:
+                f.write(f"file '{os.path.abspath(video_path).replace(chr(92), '/')}'\n")
+                f.write(f"outpoint {clip_len:.3f}\n")
+                
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", 
+            "-i", concat_txt_path, "-c", "copy", extended_video_path
+        ]
+        
+        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+        try: os.remove(concat_txt_path)
+        except: pass
+        yield "✅ Smart-looping complete! Video extended seamlessly.", f"[SMART LOOP] Created {extended_video_path} with {len(clips)} chunks.", extended_video_path
+    except Exception as e:
+        try: os.remove(concat_txt_path)
+        except: pass
+        yield None, f"[WARNING] FFmpeg smart-looping failed: {e}", video_path
+
+
 def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, restore_model, resize_factor, stop_video, random_cut, max_resolution_limit=1280):
     basic_log = ""
     raw_log = ""
@@ -362,6 +451,19 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
                         yield append_log("⚠️ Downscaling failed, using original video size.", f"[WARNING] ffmpeg resize error: {e}")
             except Exception as e:
                 yield append_log(None, f"[WARNING] Could not read video dimensions for resizing: {e}")
+                
+        # 2d. SMART VIDEO LOOPER
+        try:
+            for basic, raw, ret_vid in smart_video_looper(audio_output_path, active_video_path, folder):
+                if basic or raw:
+                    yield append_log(basic, raw)
+                if ret_vid is not None:
+                    if "temp_" in active_video_path and os.path.exists(active_video_path) and active_video_path != ret_vid:
+                        try: os.remove(active_video_path)
+                        except: pass
+                    active_video_path = ret_vid
+        except Exception as e:
+            yield append_log(None, f"[WARNING] Smart looper error: {e}")
         
         # 3. RUN WAV2LIP
         yield append_log("🎬 Binding Video and Audio (Lip-syncing)... ETA ~3 Minutes", f"-> Starting Wav2Lip Studio Pipeline...")
