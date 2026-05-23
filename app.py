@@ -41,24 +41,59 @@ def is_valid_video(vid_path):
     except:
         return False
 
-def check_server(log_yield=None):
-    if log_yield:
-        log_yield("Checking local API servers... ⏳", "[INFO] Checking if GPT-SoVITS API server is ready (might be loading models)...")
+sovits_process = None
+
+def start_sovits_server():
+    global sovits_process
+    try:
+        requests.get("http://127.0.0.1:9880/", timeout=1, proxies={"http": None, "https": None})
+        yield "Server connectivity verified! ✅", "[INFO] GPT-SoVITS server is already online!\n"
+        return
+    except:
+        pass
         
-    for attempt in range(15):
+    yield "Starting local GPT-SoVITS server... ⏳", "[INFO] Launching GPT-SoVITS in the background..."
+    
+    cmd = [os.path.join(SOVITS_RUNTIME, "python.exe"), "api_v2.py", "-a", "127.0.0.1", "-p", "9880"]
+    env = os.environ.copy()
+    env["PATH"] = SOVITS_RUNTIME + os.pathsep + env.get("PATH", "")
+    
+    try:
+        sovits_process = subprocess.Popen(cmd, cwd=SOVITS_DIR, env=env)
+        import time
+        for attempt in range(15):
+            try:
+                requests.get("http://127.0.0.1:9880/", timeout=2, proxies={"http": None, "https": None})
+                yield "Server started and ready! ✅", "[INFO] GPT-SoVITS launched successfully!\n"
+                return
+            except:
+                yield f"Waiting for background AI server (Step {attempt+1}/15)... ⏳", f"[INFO] Waiting for port 9880..."
+                time.sleep(2)
+        yield "Server failed to start in time. ❌", "[ERROR] GPT-SoVITS took too long to start.\n"
+    except Exception as e:
+        yield f"Failed to start server: {e}", f"[ERROR] Failed to start GPT-SoVITS: {e}\n"
+
+def stop_sovits_server():
+    global sovits_process
+    yield "Shutting down GPT-SoVITS to free VRAM... 🧹", "[INFO] Terminating GPT-SoVITS API Server..."
+    if sovits_process is not None:
         try:
-            requests.get("http://127.0.0.1:9880/", timeout=2, proxies={"http": None, "https": None})
-            if log_yield: log_yield("Server connectivity verified! ✅", "[INFO] GPT-SoVITS server is online and responding!\n")
-            return True
-        except requests.exceptions.ConnectionError:
-            import time
-            time.sleep(2)
-            continue
-        except Exception:
-            if log_yield: log_yield("Server connectivity verified! ✅", "[INFO] GPT-SoVITS server is online and responding!\n")
-            return True 
-            
-    return False
+            sovits_process.terminate()
+            sovits_process.wait(timeout=5)
+        except:
+            sovits_process.kill()
+        sovits_process = None
+        
+    try:
+        out = subprocess.check_output('netstat -ano | findstr :9880', shell=True).decode()
+        for line in out.splitlines():
+            if 'LISTENING' in line:
+                pid = line.strip().split()[-1]
+                subprocess.run(['taskkill', '/F', '/PID', pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                yield None, f"[INFO] Force killed process {pid} on port 9880."
+    except:
+        pass
+    yield "GPT-SoVITS unloaded from memory! ✅", "[INFO] VRAM is now free for Wav2Lip."
 
 def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, restore_model, resize_factor, stop_video, random_cut, max_resolution_limit=1280):
     basic_log = ""
@@ -86,26 +121,6 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
         yield append_log("🚨 The 'input' directory does not exist! Please create it.", f"[ERROR] The input directory '{INPUT_DIR}' does not exist.", is_error=True)
         return
 
-    yield append_log("Booting up processing pipeline...", "[INFO] Checking GPT-SoVITS connection...")
-    
-    server_ready = False
-    for attempt in range(10):
-        try:
-            requests.get("http://127.0.0.1:9880/", timeout=3, proxies={"http": None, "https": None})
-            server_ready = True
-            break
-        except requests.exceptions.ConnectionError:
-            yield append_log(f"Waiting for backend to load (Step {attempt+1}/10)... ⏳", f"[WAITING] Server not ready yet... (Attempt {attempt+1}/10. Maybe still loading weights?)")
-            import time
-            time.sleep(3)
-        except Exception:
-            server_ready = True
-            break
-
-    if not server_ready:
-        yield append_log("🚨 Background AI Server crashing or offline. Please launch 'run_servers.bat'!", "[ERROR] GPT-SoVITS API Server is NOT running!", is_error=True)
-        return
-
     folders = [f.path for f in os.scandir(INPUT_DIR) if f.is_dir()]
     if not folders:
         yield append_log("No structural folders detected in 'input/' to process.", f"[WARNING] No folders found in '{INPUT_DIR}'.")
@@ -113,9 +128,97 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
         
     yield append_log(f"Detected {len(folders)} folders! Ready and organizing...", f"[INFO] Found {len(folders)} folders to process.")
     
+    # ==========================================
+    # PHASE 1: AUDIO GENERATION (SO-VITS)
+    # ==========================================
+    folders_needing_audio = []
+    
+    for folder in folders:
+        # Check if already processed completely
+        video_files = glob.glob(os.path.join(folder, "*.mp4"))
+        generated_exists = any(os.path.basename(v).startswith("generated_video_") for v in video_files)
+        if generated_exists:
+            continue
+            
+        audio_output_path = os.path.join(folder, "generated_audio.wav")
+        if not os.path.exists(audio_output_path):
+            # Guardrail: Check text file integrity
+            txts = glob.glob(os.path.join(folder, "*.txt"))
+            if len(txts) == 0:
+                yield append_log(f"🔴 Missing text script in folder [{os.path.basename(folder)}]!", f"[ERROR] No text file found in folder '{os.path.basename(folder)}'.", is_error=True)
+                continue
+            
+            txt_path = txts[0]
+            try:
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    target_text = f.read().strip()
+                if not target_text:
+                    raise ValueError("Text string is empty.")
+            except Exception as e:
+                yield append_log(f"🔴 RED WARNING: '{os.path.basename(txt_path)}' is corrupted or entirely empty! Skipping folder.", f"[ERROR] Text file read failure: {str(e)}", is_error=True)
+                continue
+                
+            folders_needing_audio.append((folder, target_text))
+
+    if folders_needing_audio:
+        yield append_log(f"<br><b>🔊 PHASE 1: Audio Generation ({len(folders_needing_audio)} folders)</b>", f"\n========== PHASE 1: AUDIO GENERATION ==========")
+        
+        server_ready = False
+        for basic, raw in start_sovits_server():
+            yield append_log(basic, raw)
+            if "✅" in (basic or ""):
+                server_ready = True
+                
+        if not server_ready:
+            yield append_log("🚨 Failed to initialize So-VITS server. Stopping.", "[ERROR] Cannot proceed without TTS server.", is_error=True)
+            return
+
+        for folder, target_text in folders_needing_audio:
+            folder_name = os.path.basename(folder)
+            audio_output_path = os.path.join(folder, "generated_audio.wav")
+            
+            yield append_log(f"🎙 Generating voice for [{folder_name}]...", f"[INFO] Target Text: '{target_text}'\n-> Starting GPT-SoVITS TTS...")
+            
+            # Map target_lang logic
+            tts_lang = "zh" if "Chinese" in target_lang else "ja" if "Japanese" in target_lang else "en"
+            prompt_lang = "zh" if "Chinese" in ref_lang else "ja" if "Japanese" in ref_lang else "en"
+            
+            tts_payload = {
+                "text": target_text,
+                "text_lang": tts_lang,
+                "ref_audio_path": ref_audio,
+                "prompt_text": ref_text,
+                "prompt_lang": prompt_lang,
+                "media_type": "wav"
+            }
+            
+            try:
+                response = requests.post("http://127.0.0.1:9880/tts", json=tts_payload, timeout=180, proxies={"http": None, "https": None})
+                if response.status_code != 200:
+                    yield append_log(f"🔴 Audio engine network crashed for [{folder_name}].", f"[ERROR] TTS failed. Status {response.status_code}: {response.text}", is_error=True)
+                    continue
+                with open(audio_output_path, "wb") as f:
+                    f.write(response.content)
+                yield append_log("✅ Voice rendered successfully!", f"-> TTS Audio generated successfully: {audio_output_path}")
+            except Exception as e:
+                yield append_log(f"🔴 Fatal connection error to audio generator.", f"[ERROR] TTS request error: {str(e)}", is_error=True)
+                continue
+                
+    else:
+        yield append_log("<br><b>🔊 PHASE 1: Audio Generation Skipped</b>", "\n[INFO] All folders already have generated audio. Skipping So-VITS startup.")
+
+    # Unconditionally ensure So-VITS is shut down before Phase 2 to guarantee VRAM is free
+    for basic, raw in stop_sovits_server():
+        if basic or raw:
+            yield append_log(basic, raw)
+
+    # ==========================================
+    # PHASE 2: VIDEO GENERATION (WAV2LIP)
+    # ==========================================
+    yield append_log(f"<br><b>🎬 PHASE 2: Video Generation & Lipsync</b>", f"\n========== PHASE 2: VIDEO GENERATION ==========")
+    
     for folder in folders:
         folder_name = os.path.basename(folder)
-        yield append_log(f"<br><b>➡️ Working on Folder [{folder_name}]</b>", f"\n========== Processing Folder: {folder_name} ==========")
         
         # Check if already processed
         video_files = glob.glob(os.path.join(folder, "*.mp4"))
@@ -126,22 +229,13 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
             continue
             
         videos = [v for v in video_files if not os.path.basename(v).startswith("generated_video_")]
-        txts = glob.glob(os.path.join(folder, "*.txt"))
+        audio_output_path = os.path.join(folder, "generated_audio.wav")
         
-        # Guardrail: Check text file integrity
-        if len(txts) == 0:
-            yield append_log("🔴 Missing text script!", f"[ERROR] No text file found in folder '{folder_name}'.", is_error=True)
+        if not os.path.exists(audio_output_path):
+            yield append_log(f"🔴 Missing audio file for [{folder_name}], skipping video phase.", f"[ERROR] Missing generated_audio.wav in {folder_name}.", is_error=True)
             continue
             
-        txt_path = txts[0]
-        try:
-            with open(txt_path, "r", encoding="utf-8") as f:
-                target_text = f.read().strip()
-            if not target_text:
-                raise ValueError("Text string is empty.")
-        except Exception as e:
-            yield append_log(f"🔴 RED WARNING: '{os.path.basename(txt_path)}' is corrupted or entirely empty! Skipping folder.", f"[ERROR] Text file read failure: {str(e)}", is_error=True)
-            continue
+        yield append_log(f"<br><b>➡️ Working on Video for [{folder_name}]</b>", f"\n========== Processing Video: {folder_name} ==========")
         
         # Guardrail: Check video file integrity & fallback logic
         active_video_path = None
@@ -170,36 +264,6 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
         
         import time
         start_time = time.time()
-        
-        yield append_log(f"🎙 Generating new AI Voice audio tracks...", f"[INFO] Target Text: '{target_text}'\n-> Starting GPT-SoVITS TTS...")
-        
-        # 2. RUN TTS
-        audio_output_path = os.path.join(folder, "generated_audio.wav")
-        if os.path.exists(audio_output_path):
-            yield append_log("✅ Found pre-existing audio track, skipping voice render!", f"-> Found '{audio_output_path}', bypassing TTS phase.")
-        else:
-            tts_payload = {
-                "text": target_text,
-                "text_lang": "zh" if "Chinese" in target_lang else "en",
-                "ref_audio_path": ref_audio,
-                "prompt_text": ref_text,
-                "prompt_lang": "zh" if "Chinese" in ref_lang else "en",
-                "media_type": "wav"
-            }
-            
-            try:
-                response = requests.post("http://127.0.0.1:9880/tts", json=tts_payload, timeout=180, proxies={"http": None, "https": None})
-                if response.status_code != 200:
-                    yield append_log(f"🔴 Audio engine network crashed. Skipping this folder.", f"[ERROR] TTS failed. Status {response.status_code}: {response.text}", is_error=True)
-                    continue
-            except Exception as e:
-                yield append_log(f"🔴 Fatal connection error to audio generator.", f"[ERROR] TTS request error: {str(e)}", is_error=True)
-                continue
-                
-            with open(audio_output_path, "wb") as f:
-                f.write(response.content)
-                
-            yield append_log("✅ Voice rendered successfully!", f"-> TTS Audio generated successfully: {audio_output_path}")
         
         # 2b. RANDOM VIDEO CUTTER
         if random_cut:
@@ -253,6 +317,7 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
                     yield append_log(None, f"   [Cutter] Video length is too short to cut ({round(video_duration,1)}s <= audio {round(audio_duration,1)}s). Using full.")
             else:
                 yield append_log(None, f"[WARNING] Invalid duration fetched (V: {video_duration}, A: {audio_duration}), skipping random cut.")
+
         # 2c. VIDEO DOWN-SAMPLER / PREPROCESS
         if max_resolution_limit and max_resolution_limit > 0:
             try:
@@ -275,7 +340,7 @@ def process_folders(ref_audio, ref_text, ref_lang, target_lang, video_quality, r
                     ffmpeg_cmd = [
                         "ffmpeg", "-y", "-i", active_video_path,
                         "-vf", f"scale={new_width}:{new_height}",
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                        "-c:v", "mpeg4", "-q:v", "2",
                         "-c:a", "copy", resized_path
                     ]
                     

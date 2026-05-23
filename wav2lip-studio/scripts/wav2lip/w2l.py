@@ -510,12 +510,10 @@ class W2l:
             if needs_processing:
                 current_frame += 1
 
-        import concurrent.futures
-        max_workers = 3 if self.video_quality == "High" else 8
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for i, result_frame in enumerate(executor.map(_process_frame, frame_states)):
-                print(f"[INFO] saving: {i} of {nb_frames} - ", end="\r")
-                video_output.write(result_frame)
+        for i, state in enumerate(frame_states):
+            result_frame = _process_frame(state)
+            print(f"[INFO] saving: {i} of {nb_frames} - ", end="\r")
+            video_output.write(result_frame)
         # release memory
         video_output.release()
         model.cpu()
